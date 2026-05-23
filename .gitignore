@@ -1,0 +1,15 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Node (in case you clone-and-test code from this README in a sub-folder)
+node_modules/
+.next/
+.env*
+!.env.example
+*.log
