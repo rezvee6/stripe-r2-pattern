@@ -13,3 +13,7 @@ node_modules/
 .env*
 !.env.example
 *.log
+
+# Generated from README.md by scripts/extract-snippets.mjs
+.snippets/
+coverage/

@@ -14,13 +14,14 @@ This markdown file is intentionally self-sufficient — every code block, env va
 4. [Required services](#required-services)
 5. [Dependencies](#dependencies)
 6. [Environment variables](#environment-variables)
-7. [Source code — six files](#source-code)
+7. [Source code — seven files](#source-code)
 8. [Client wiring (Buy button + Success page)](#client-wiring)
 9. [Stripe dashboard setup](#stripe-dashboard-setup)
 10. [Cloudflare R2 setup](#cloudflare-r2-setup)
-11. [Testing checklist](#testing-checklist)
-12. [Common pitfalls](#common-pitfalls)
-13. [Improvements — priority-ranked](#improvements)
+11. [Database setup](#database-setup)
+12. [Testing checklist](#testing-checklist)
+13. [Common pitfalls](#common-pitfalls)
+14. [Improvements — priority-ranked](#improvements)
 
 ---
 
@@ -66,17 +67,18 @@ USER                  YOUR APP                     STRIPE                R2
   |--------------------------------------------------------------------->| download
 ```
 
-In parallel, Stripe POSTs to `/api/webhooks/stripe` on `checkout.session.completed`. In this baseline pattern the webhook just logs — extend it to persist orders + send emails (see [Improvements](#improvements)).
+In parallel, Stripe POSTs to `/api/webhooks/stripe` on `checkout.session.completed`. The webhook dedupes the event by ID and records the purchase in a `purchases` table. Sending a post-purchase email is still on you (see [Improvements P2.3](#improvements)).
 
 ## Required services
 
 1. **Stripe account** with a product + price created
 2. **Cloudflare R2 bucket** with the file uploaded and an API token
+3. **Supabase project** (or any Postgres; the snippets use `@supabase/supabase-js`) for webhook dedupe + purchase records
 
 ## Dependencies
 
 ```bash
-npm install stripe @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
+npm install stripe@23 @aws-sdk/client-s3 @aws-sdk/s3-request-presigner @supabase/supabase-js
 ```
 
 (`@stripe/stripe-js` is only needed if you do client-side Stripe.js things — not required for the redirect-to-Checkout flow.)
@@ -95,25 +97,41 @@ R2_ACCESS_KEY_ID=...                    # Cloudflare R2 API token
 R2_SECRET_ACCESS_KEY=...                # paired secret
 R2_BUCKET_NAME=my-bucket
 R2_OBJECT_KEY=my-product-v1.zip         # path of the file inside the bucket
+
+SUPABASE_URL=https://xxxx.supabase.co   # Supabase → Project Settings → API
+SUPABASE_SERVICE_ROLE_KEY=...           # server-only — never expose with a NEXT_PUBLIC_ prefix
 ```
 
 ---
 
 ## Source code
 
-Six files. Each block below is preceded by a `> Create at:` marker telling you where to put it.
+Seven files. Each block below is preceded by a `> Create at:` marker telling you where to put it.
 
 ### `lib/stripe.ts`
 
 > Create at: `lib/stripe.ts`
 
-Stripe client + a helper that re-verifies that a session was paid AND that it was paid for the expected product.
+A single lazily-created Stripe client (`getStripe()`) shared by every route, plus a helper that re-verifies that a session was paid AND that it was paid for the expected product.
+
+Creating the client lazily means a missing `STRIPE_SECRET_KEY` fails with a clear error the first time a request needs Stripe, not as a vague crash when the module loads. The API version is pinned so upgrading the SDK can't silently change response shapes. Use the version your installed SDK is typed for. The `apiVersion` field's TypeScript type only accepts that one value, so a mismatch shows up as a type error.
 
 ```ts
 import Stripe from 'stripe';
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+let cached: Stripe | null = null;
 
+export function getStripe(): Stripe {
+  if (cached) return cached;
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) {
+    throw new Error('STRIPE_SECRET_KEY is not set');
+  }
+  cached = new Stripe(key, {
+    apiVersion: '2026-09-30.endive', // pin to avoid surprise breaking changes on SDK upgrade
+  });
+  return cached;
+}
 
 /**
  * Verify a Stripe checkout session and ensure payment is completed
@@ -126,6 +144,7 @@ export async function verifyStripeSession(sessionId: string): Promise<{
   error?: string;
 }> {
   try {
+    const stripe = getStripe();
     const session = await stripe.checkout.sessions.retrieve(sessionId);
 
     // Verify payment status
@@ -230,6 +249,29 @@ export async function getSignedDownloadUrl(
 }
 ```
 
+### `lib/supabase.ts`
+
+> Create at: `lib/supabase.ts`
+
+A server-only Supabase client using the service-role key, used by the webhook. It bypasses row-level security, so import it only from route handlers and never from client components.
+
+```ts
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+
+let cached: SupabaseClient | null = null;
+
+export function getSupabaseAdmin(): SupabaseClient {
+  if (cached) return cached;
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) {
+    throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set');
+  }
+  cached = createClient(url, key, { auth: { persistSession: false } });
+  return cached;
+}
+```
+
 ### `app/api/checkout/route.ts`
 
 > Create at: `app/api/checkout/route.ts`
@@ -238,12 +280,12 @@ Creates a Stripe Checkout Session and returns the URL. Replace `/product/your-pr
 
 ```ts
 import { NextRequest, NextResponse } from 'next/server';
-import Stripe from 'stripe';
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+import { getStripe } from '@/lib/stripe';
 
 export async function POST(request: NextRequest) {
   try {
+    const stripe = getStripe();
+
     // Get product/price ID from environment variable
     const productOrPriceId = process.env.STRIPE_PRICE_ID;
 
@@ -274,7 +316,7 @@ export async function POST(request: NextRequest) {
     }
 
     const session = await stripe.checkout.sessions.create({
-      payment_method_types: ['card'],
+      allowed_payment_method_types: ['card'],
       line_items: [
         {
           price: priceId,
@@ -308,12 +350,11 @@ Read-only confirmation — used by the success page on first load to display "Pa
 
 ```ts
 import { NextRequest, NextResponse } from 'next/server';
-import Stripe from 'stripe';
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+import { getStripe } from '@/lib/stripe';
 
 export async function POST(request: NextRequest) {
   try {
+    const stripe = getStripe();
     const { sessionId } = await request.json();
 
     if (!sessionId) {
@@ -433,17 +474,29 @@ export async function POST(request: NextRequest) {
 
 > Create at: `app/api/webhooks/stripe/route.ts`
 
-Verifies the Stripe signature before reacting to events. Right now it just logs — see [Improvements P0.3 + P0.4](#improvements) for the DB persistence + email-on-purchase additions you'll want before this runs in production.
+Verifies the Stripe signature, dedupes by `event.id`, then records the purchase. Stripe can deliver the same event more than once and retries on any non-2xx response, so the handler is idempotent at two levels:
+
+- **Event claim.** The handler inserts `event.id` into `stripe_events` before doing any work. A primary-key conflict (`23505`) means the event was already handled, so it returns 200 and Stripe stops retrying. If processing then fails, the claim is released so Stripe's retry runs the work again and isn't skipped as a duplicate.
+- **Purchase upsert.** `purchases.stripe_session_id` is unique, so a purchase can't be written twice, even if two deliveries race past the claim.
+
+Needs the tables from [Database setup](#database-setup).
 
 ```ts
 import { NextRequest, NextResponse } from 'next/server';
 import Stripe from 'stripe';
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
-
-const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
+import { getStripe } from '@/lib/stripe';
+import { getSupabaseAdmin } from '@/lib/supabase';
 
 export async function POST(request: NextRequest) {
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    console.error('STRIPE_WEBHOOK_SECRET is not set');
+    return NextResponse.json(
+      { error: 'Webhook not configured' },
+      { status: 500 }
+    );
+  }
+
   const body = await request.text();
   const signature = request.headers.get('stripe-signature');
 
@@ -457,7 +510,7 @@ export async function POST(request: NextRequest) {
   let event: Stripe.Event;
 
   try {
-    event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
+    event = getStripe().webhooks.constructEvent(body, signature, webhookSecret);
   } catch (err: any) {
     console.error('Webhook signature verification failed:', err.message);
     return NextResponse.json(
@@ -466,31 +519,74 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // Handle the event
+  const supabase = getSupabaseAdmin();
+
+  // Claim the event. A duplicate key means we've already handled it.
+  const { error: claimError } = await supabase
+    .from('stripe_events')
+    .insert({ id: event.id, type: event.type });
+
+  if (claimError) {
+    if (claimError.code === '23505') {
+      return NextResponse.json({ received: true, duplicate: true });
+    }
+    console.error('Failed to record webhook event:', claimError);
+    return NextResponse.json(
+      { error: 'Database error' },
+      { status: 500 }
+    );
+  }
+
+  try {
+    await handleEvent(event);
+  } catch (err) {
+    console.error(`Failed to process ${event.type} ${event.id}:`, err);
+    // Release the claim so Stripe's retry is processed instead of skipped as a duplicate.
+    await supabase.from('stripe_events').delete().eq('id', event.id);
+    return NextResponse.json(
+      { error: 'Processing failed' },
+      { status: 500 }
+    );
+  }
+
+  return NextResponse.json({ received: true });
+}
+
+async function handleEvent(event: Stripe.Event) {
   switch (event.type) {
-    case 'checkout.session.completed':
+    case 'checkout.session.completed': {
       const session = event.data.object as Stripe.Checkout.Session;
-      console.log('Payment successful for session:', session.id);
-      console.log('Customer email:', session.customer_details?.email);
 
-      // Here you can:
-      // - Send a custom email with download links
-      // - Store the purchase in a database
-      // - Grant access to protected content
-      // - Trigger any other post-purchase actions
+      // With delayed payment methods (bank debits etc.), `completed` fires before
+      // the money settles. This pattern is card-only, but guard anyway.
+      if (session.payment_status !== 'paid') {
+        console.log(`Session ${session.id} completed but not paid yet`);
+        return;
+      }
 
+      const { error } = await getSupabaseAdmin()
+        .from('purchases')
+        .upsert(
+          {
+            stripe_session_id: session.id,
+            customer_email: session.customer_details?.email ?? null,
+            product: session.metadata?.product ?? null,
+            amount_total: session.amount_total ?? 0,
+            currency: session.currency ?? null,
+            paid_at: new Date(event.created * 1000).toISOString(),
+          },
+          { onConflict: 'stripe_session_id', ignoreDuplicates: true }
+        );
+
+      if (error) throw error;
+
+      // Next: send the post-purchase email here (Improvements P2.3).
       break;
-
-    case 'payment_intent.succeeded':
-      const paymentIntent = event.data.object as Stripe.PaymentIntent;
-      console.log('PaymentIntent succeeded:', paymentIntent.id);
-      break;
+    }
 
     default:
       console.log(`Unhandled event type ${event.type}`);
   }
-
-  return NextResponse.json({ received: true });
 }
 ```
 
@@ -500,7 +596,9 @@ export async function POST(request: NextRequest) {
 
 ### Buy button
 
-Drop this into your product page (must be a client component because of the `onClick`):
+> Create at: `components/BuyButton.tsx`
+
+Render `<BuyButton />` on your product page (it must be a client component because of the `onClick`):
 
 ```tsx
 'use client';
@@ -549,7 +647,9 @@ export function BuyButton() {
 
 ### Success page
 
-Drop this at `app/product/your-product/success/page.tsx`. The two-step UX (verify on mount → Download on click) keeps the signed URL fresh: if the buyer leaves the tab open for hours, the URL won't expire until they actually press Download.
+> Create at: `app/product/your-product/success/page.tsx`
+
+The two-step UX (verify on mount → Download on click) keeps the signed URL fresh: if the buyer leaves the tab open for hours, the URL won't expire until they actually press Download.
 
 ```tsx
 'use client';
@@ -660,6 +760,7 @@ function SuccessPageContent() {
       <button onClick={handleDownload} disabled={downloading}>
         {downloading ? 'Generating download…' : 'Download'}
       </button>
+      {error && <p role="alert">{error}</p>}
       <p>Download link expires in 15 minutes.</p>
     </div>
   );
@@ -683,7 +784,7 @@ export default function SuccessPage() {
 3. **Developers → API keys.** Copy the **Secret key** (`sk_test_...` in test mode) into `STRIPE_SECRET_KEY`.
 4. **Developers → Webhooks → Add endpoint:**
    - URL: `https://yourdomain.com/api/webhooks/stripe`
-   - Events: `checkout.session.completed`, `payment_intent.succeeded`
+   - Events: `checkout.session.completed`
    - Copy the **Signing secret** (`whsec_...`) into `STRIPE_WEBHOOK_SECRET`.
 
 ## Cloudflare R2 setup
@@ -696,6 +797,39 @@ export default function SuccessPage() {
    - Copy **Access Key ID** → `R2_ACCESS_KEY_ID`
    - Copy **Secret Access Key** → `R2_SECRET_ACCESS_KEY`
 5. Find your **Cloudflare Account ID** in the right sidebar of the R2 dashboard → `R2_ACCOUNT_ID`.
+
+## Database setup
+
+1. Create a project at <https://supabase.com/dashboard>.
+2. **Project Settings → API.** Copy the **Project URL** → `SUPABASE_URL` and the **service_role** key → `SUPABASE_SERVICE_ROLE_KEY`.
+3. **SQL Editor:** run this migration:
+
+```sql
+-- One row per Stripe event we've handled (webhook dedupe).
+create table stripe_events (
+  id text primary key,
+  type text not null,
+  processed_at timestamptz not null default now()
+);
+
+-- One row per paid checkout session.
+create table purchases (
+  id bigint generated always as identity primary key,
+  stripe_session_id text not null unique,
+  customer_email text,
+  product text,
+  amount_total bigint not null,   -- smallest currency unit (e.g. cents)
+  currency text,
+  paid_at timestamptz not null,
+  created_at timestamptz not null default now()
+);
+
+create index purchases_customer_email_idx on purchases (customer_email);
+
+-- RLS on with no policies: only the server-side service-role key can read/write.
+alter table stripe_events enable row level security;
+alter table purchases enable row level security;
+```
 
 ---
 
@@ -715,9 +849,10 @@ Always start in Stripe's test mode (`sk_test_...`).
    - Submit → redirected to the success page
 3. Confirm the success page shows "Payment successful" + customer email.
 4. Click **Download** → file downloads from R2.
-5. The webhook terminal should show `checkout.session.completed` arriving.
-6. Refresh the success page — Download button should still work (within 15-min URL TTL).
-7. Switch to live mode by changing the env-var prefixes (`sk_live_...`) and updating the webhook endpoint URL in the Stripe dashboard to your production domain.
+5. The webhook terminal should show `checkout.session.completed` arriving with a `200`. Check that Supabase has one new row in `purchases` and one in `stripe_events`.
+6. Test idempotency: resend the same event with `stripe events resend evt_xxx` (copy the ID from the `stripe listen` output). The response should be `{"received":true,"duplicate":true}` and `purchases` should still have one row.
+7. Refresh the success page — Download button should still work (within 15-min URL TTL).
+8. Switch to live mode by changing the env-var prefixes (`sk_live_...`) and updating the webhook endpoint URL in the Stripe dashboard to your production domain.
 
 ---
 
@@ -728,7 +863,8 @@ Always start in Stripe's test mode (`sk_test_...`).
 - **R2 endpoint is `<account>.r2.cloudflarestorage.com`** — not `<bucket>.<account>.r2…`. The bucket goes in the path / SDK config, not the hostname.
 - **Webhook signing secret is per-endpoint.** Changing the webhook URL gives you a new secret. Update both.
 - **R2 API tokens are scoped at creation.** If you can't read objects with your token, check it has Object Read for your specific bucket.
-- **Stripe SDK version ≠ API version.** Without an explicit `apiVersion`, the SDK uses whatever its current default is — which can change between `npm install`s. Pin it (see [Improvements P0.1](#improvements)).
+- **Stripe SDK version ≠ API version.** Without an explicit `apiVersion`, the SDK uses whatever its current default is — which can change between `npm install`s. `getStripe()` in `lib/stripe.ts` pins it. When you upgrade the SDK, update the pin deliberately.
+- **Never ship the service-role key to the browser.** It bypasses RLS. Keep it out of `NEXT_PUBLIC_*` vars and only import `lib/supabase.ts` from server code.
 - **`success_url` MUST be HTTPS in live mode.** HTTP is allowed in test mode only.
 
 ---
@@ -737,77 +873,15 @@ Always start in Stripe's test mode (`sk_test_...`).
 
 Prioritised so you know what to fix BEFORE reusing this pattern on the next product, vs nice-to-haves you can iterate to.
 
-Each P0 / P1 item includes a replacement snippet you can paste in.
+Each P1 item includes a replacement snippet you can paste in.
 
-### P0 — fix before reusing
+### P0 — done (now part of the source above)
 
-**P0.1 — DRY the Stripe client + lazy-init + pin API version.**
+- **P0.1 — Shared, lazily-created Stripe client with a pinned API version.** See `getStripe()` in [`lib/stripe.ts`](#libstripets).
+- **P0.2 — Webhook idempotency.** The webhook claims `event.id` in `stripe_events` and releases the claim if processing fails, so retries aren't lost.
+- **P0.3 — Persist purchases.** `checkout.session.completed` upserts into `purchases`, keyed on the unique `stripe_session_id`.
 
-Currently `new Stripe(process.env.STRIPE_SECRET_KEY!)` appears in 4 places, and uses `!` non-null assertion. If the env var is missing, the Stripe SDK throws at module load — vague crash, hard to debug. Replace with a factory:
-
-```ts
-// lib/stripe.ts — replace the top-of-file `const stripe = ...` with this:
-import Stripe from 'stripe';
-
-let cached: Stripe | null = null;
-
-export function getStripe(): Stripe {
-  if (cached) return cached;
-  const key = process.env.STRIPE_SECRET_KEY;
-  if (!key) {
-    throw new Error('STRIPE_SECRET_KEY is not set');
-  }
-  cached = new Stripe(key, {
-    apiVersion: '2025-09-30.acacia', // pin to avoid surprise breaking changes on SDK upgrade
-  });
-  return cached;
-}
-```
-
-Then in every route: `import { getStripe } from '@/lib/stripe'; const stripe = getStripe();`.
-
-**P0.2 — Webhook idempotency.**
-
-Stripe re-delivers webhook events on any non-2xx response. As soon as your handler does DB writes, you need to dedupe by `event.id`:
-
-```ts
-// Inside the webhook POST, BEFORE the switch:
-const { error: dedupErr } = await supabase
-  .from('stripe_events')
-  .insert({ id: event.id, type: event.type })
-  .single();
-
-if (dedupErr && dedupErr.code === '23505') {
-  // Already processed — return 200 so Stripe stops retrying.
-  return NextResponse.json({ received: true, duplicate: true });
-}
-```
-
-(Migration: `create table stripe_events (id text primary key, type text, processed_at timestamptz default now());`)
-
-**P0.3 — Persist purchases.**
-
-The webhook handler today is empty (just `console.log`). Without persistence:
-- No order history to query
-- No way to do customer service ("when did I buy this?")
-- Every download verification re-hits the Stripe API (200–500 ms each)
-
-Add to the `checkout.session.completed` case:
-
-```ts
-case 'checkout.session.completed': {
-  const session = event.data.object as Stripe.Checkout.Session;
-  await supabase.from('purchases').insert({
-    stripe_session_id: session.id,
-    customer_email: session.customer_details?.email ?? null,
-    product: session.metadata?.product ?? null,
-    amount_total: session.amount_total ?? 0,
-    currency: session.currency ?? null,
-    paid_at: new Date().toISOString(),
-  });
-  break;
-}
-```
+A possible next step: `/api/download` still re-checks every download with the Stripe API (200–500 ms each). It could look up `purchases` first and only fall back to Stripe if the webhook hasn't arrived yet.
 
 ### P1 — multi-product readiness
 
@@ -977,6 +1051,19 @@ For multi-product, every success page repeats the same loading / error / verify 
 Stripe provides the `4242` test card. A Playwright test of the full flow (Buy → Pay → Verify → Download → file present) catches regressions before production.
 
 ---
+
+## Testing the snippets in this README
+
+Every code block with a `> Create at:` marker is pulled out into `.snippets/` (gitignored) by `scripts/extract-snippets.mjs`, then type-checked and unit-tested against those exact files. Stripe, Supabase and `fetch` are mocked. R2 presigning and Stripe webhook signatures are computed for real, since neither needs the network.
+
+```bash
+npm install
+npm test               # unit tests
+npm run test:coverage  # with coverage report (HTML in coverage/), fails under 95% lines / 90% branches
+npm run typecheck      # tsc over the snippets + tests
+```
+
+If you edit a snippet, run these again. The tests check the README's code itself, so a broken snippet fails them.
 
 ## Notes when porting this `.md` to a different project
 
